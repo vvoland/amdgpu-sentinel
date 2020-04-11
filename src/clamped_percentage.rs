@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 use std::convert::Into;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct ClampedPercentage(pub f64);
 
 #[derive(Debug)]
