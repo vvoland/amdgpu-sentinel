@@ -261,6 +261,7 @@ impl<'a> PolarisGpu<'a> {
             .skip(1)
             .next().expect("Range is not prefixed?!")
             .trim()
+            .replace("mV", "")
             .replace("MHz", "");
 
         let mut range_split = line.split_whitespace();
@@ -464,6 +465,8 @@ mod tests {
         ";
 
         assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "SCLK"), RangeInclusive::new(300, 2000));
+        assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "MCLK"), RangeInclusive::new(300, 2250));
+        assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "VDDC"), RangeInclusive::new(750, 1150));
     }
 }
 
