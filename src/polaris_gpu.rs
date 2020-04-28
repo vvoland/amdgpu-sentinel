@@ -1,26 +1,23 @@
 use crate::clamped_percentage::ClampedPercentage;
+use crate::sysfs;
+use crate::polaris_gpu_fan;
+
 use std::path::Path;
 use std::fmt::Display;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::fs::File;
-use std::io::prelude::*;
+use polaris_gpu_fan::PolarisGpuFan;
 
 pub struct PolarisGpu<'a> {
     pub name: &'a str,
     sysfs_dir: PathBuf,
+    fan: PolarisGpuFan
 }
 
 pub enum TemperatureSensor {
     Edge,
     Junction,
     Memory
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum FanMode {
-    Auto,
-    Manual
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,14 +57,19 @@ pub enum OverclockError {
 impl<'a> PolarisGpu<'a> {
     pub fn new<P: AsRef<Path>>(name: &'a str, sysfs_dir: P) -> Self {
         PolarisGpu {
-            name: name,
-            sysfs_dir: sysfs_dir.as_ref().to_path_buf()
+            name,
+            sysfs_dir: sysfs_dir.as_ref().to_path_buf(),
+            fan: PolarisGpuFan::new(sysfs_dir.as_ref().join("hwmon/hwmon0"), 1)
         }
     }
 
     pub fn usage(&self) -> ClampedPercentage {
-        let percent: u32 = Self::parse_string_from_file(&self.sysfs_dir.join("gpu_busy_percent"));
+        let percent: u32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("gpu_busy_percent"));
         ClampedPercentage::new(percent)
+    }
+    
+    pub fn fan(&self) -> &PolarisGpuFan {
+        &self.fan
     }
 
     pub fn temperature(&self) -> f32 {
@@ -75,7 +77,7 @@ impl<'a> PolarisGpu<'a> {
     }
 
     pub fn power_limit(&self) -> f32 {
-        let wattage: f32 = Self::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap"));
+        let wattage: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap"));
         wattage / Self::WATTAGE_DIVISOR
     }
 
@@ -83,8 +85,8 @@ impl<'a> PolarisGpu<'a> {
     fn to_real_wattage(value: f32) -> u32 { (value * Self::WATTAGE_DIVISOR) as u32 }
 
     pub fn power_limit_range(&self) -> RangeInclusive<f32> {
-        let min: f32 = Self::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_min"));
-        let max: f32 = Self::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_max"));
+        let min: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_min"));
+        let max: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_max"));
 
         let divisor = Self::WATTAGE_DIVISOR;
 
@@ -97,48 +99,10 @@ impl<'a> PolarisGpu<'a> {
 
         if range.contains(&wattage) {
             let real_value: u32 = Self::to_real_wattage(wattage);
-            Self::write(path, &real_value.to_string());
+            sysfs::write(path, &real_value.to_string());
         } else {
             panic!("Wattage must be in range [{}, {}]", range.start(), range.end());
         }
-    }
-
-    const FAN_MODE_FILE: &'static str = "hwmon/hwmon0/pwm1_enable";
-    const FAN_PWM_FILE:  &'static str = "hwmon/hwmon0/pwm1";
-
-
-    pub fn fan_mode(&self) -> FanMode {
-        let mode: u32 = Self::parse_string_from_file(&self.sysfs_dir.join(Self::FAN_MODE_FILE));
-
-        match mode {
-            1 => FanMode::Manual,
-            2 => FanMode::Auto,
-            _ => panic!("Unknown fan mode")
-        }
-    }
-
-    pub fn set_fan_mode(&self, mode: FanMode) {
-        let value = match mode {
-            FanMode::Manual => 1,
-            FanMode::Auto => 2
-        };
-        let path = self.sysfs_dir.join(Self::FAN_MODE_FILE);
-
-        Self::write(path, &value.to_string());
-    }
-
-    pub fn fan_speed(&self) -> ClampedPercentage {
-        let path: PathBuf = self.sysfs_dir.join(Self::FAN_PWM_FILE);
-        let value: u8 = Self::parse_string_from_file(&path);
-
-        ClampedPercentage::new(value as f32 / 255f32 * 100f32)
-    }
-
-    pub fn set_fan_speed(&self, speed: ClampedPercentage) {
-        let value: u8 = (speed.0 * 255f64 / 100f64) as u8;
-        let path: PathBuf = self.sysfs_dir.join(Self::FAN_PWM_FILE);
-
-        Self::write(path, &value.to_string());
     }
 
     const PSTATE_MEMORY_FILE: &'static str = "pp_dpm_mclk";
@@ -146,26 +110,26 @@ impl<'a> PolarisGpu<'a> {
 
     pub fn pstate_memory(&self) -> u32 {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_MEMORY_FILE);
-        let data: String = Self::read_string_from_file(&path);
+        let data: String = sysfs::read_string_from_file(&path);
 
         Self::parse_current_pstate(data)
     }
 
     pub fn set_pstate_memory(&self, state: u32) {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_MEMORY_FILE);
-        Self::write(path, &state.to_string());
+        sysfs::write(path, &state.to_string());
     }
  
     pub fn pstate_core(&self) -> u32 {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_CORE_FILE);
-        let data: String = Self::read_string_from_file(&path);
+        let data: String = sysfs::read_string_from_file(&path);
 
         Self::parse_current_pstate(data)
     }
 
     pub fn set_pstate_core(&self, state: u32) {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_CORE_FILE);
-        Self::write(path, &state.to_string());
+        sysfs::write(path, &state.to_string());
     }
 
     pub fn modify_pstate_core(&self, state: u32, clock: u32, voltage: u32) -> Result<(), OverclockError> {
@@ -182,12 +146,12 @@ impl<'a> PolarisGpu<'a> {
 
     pub fn commit_pstates(&self) {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_TABLE_FILE);
-        Self::write(path, "c");
+        sysfs::write(path, "c");
     }
 
     pub fn reset_pstates(&self) {
         let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_TABLE_FILE);
-        Self::write(path, "r");
+        sysfs::write(path, "r");
     }
 
     fn modify_pstate(&self, clock: u32, voltage: u32, cmd: &String, kind: &'static str) 
@@ -199,12 +163,12 @@ impl<'a> PolarisGpu<'a> {
             return Err(OverclockError::Disabled);
         }
 
-        match Self::try_write(&path, &cmd) {
+        match sysfs::try_write(&path, &cmd) {
             Ok(_) => Ok(()),
             Err(err) => {
                 match err.kind() {
                     std::io::ErrorKind::InvalidData => {
-                        let data: String = Self::read_string_from_file(&path);
+                        let data: String = sysfs::read_string_from_file(&path);
                         let clock_range = Self::parse_acceptable_range(&data, kind);
                         let voltage_range = Self::parse_acceptable_range(&data, "VDDC");
 
@@ -299,7 +263,7 @@ impl<'a> PolarisGpu<'a> {
 
     pub fn force_performance_level(&self) -> PerformanceLevel {
         let path: PathBuf = self.sysfs_dir.join(Self::FORCE_PERFORMANCE_LEVEL_FILE);
-        let data = Self::read_string_from_file(&path).trim().to_string();
+        let data = sysfs::read_string_from_file(&path).trim().to_string();
 
         Self::PERFORMANCE_LEVEL_TO_STRING.iter()
             .filter(|(_, name)| data.eq_ignore_ascii_case(name))
@@ -313,14 +277,14 @@ impl<'a> PolarisGpu<'a> {
             .filter(|(i_level, _)| i_level.eq(&level))
             .next().expect("Invalid performance level").1;
 
-        Self::write(path, value);
+        sysfs::write(path, value);
     }
 
     const PCIE_LEVEL_FILE: &'static str = "pp_dpm_pcie";
     // TODO: Read real available levels, maybe split it into bandwidth and width
 
     pub fn pcie_level(&self) -> PcieLevel {
-        let mode: u32 = Self::parse_string_from_file(&self.sysfs_dir.join(Self::PCIE_LEVEL_FILE));
+        let mode: u32 = sysfs::parse_string_from_file(&self.sysfs_dir.join(Self::PCIE_LEVEL_FILE));
 
         match mode {
             0 => PcieLevel::Gen1,
@@ -336,7 +300,7 @@ impl<'a> PolarisGpu<'a> {
         };
         let path = self.sysfs_dir.join(Self::PCIE_LEVEL_FILE);
 
-        Self::write(path, &value.to_string());
+        sysfs::write(path, &value.to_string());
     }
 
 
@@ -355,7 +319,7 @@ impl<'a> PolarisGpu<'a> {
         if !path.is_file() {
             None
         } else {
-            let value: f32 = Self::parse_string_from_file(&path);
+            let value: f32 = sysfs::parse_string_from_file(&path);
             Some(value / 1000f32)
         }
     }
@@ -370,56 +334,6 @@ impl<'a> PolarisGpu<'a> {
             (PerformanceLevel::ProfilePeak, "profile_peak"),
             (PerformanceLevel::ProfileStandard, "profile_standard")
     ];
-
-    fn try_write<P: AsRef<Path>>(path: P, value: &'_ str) -> Result<(), std::io::Error> {
-
-        let value_with_newline = format!("{}\n", value);
-
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create_new(false)
-            .open(path.as_ref())
-        {
-            Ok(mut file) => {
-                match file.write_all(value_with_newline.as_bytes()) {
-                    Ok(_) => file.sync_all(),
-                    Err(err) => Err(err)
-                }
-            }
-            Err(err) => Err(err)
-        }
-    }
-
-    const DEBUG: bool = false;
-
-    fn write<P: AsRef<Path>>(path: P, value: &'_ str) {
-
-        if Self::DEBUG {
-            let value_with_newline = format!("{}\n", value);
-            let path_str = path.as_ref().to_str().unwrap();
-
-            println!("Writing: {} -> {}", value_with_newline, path_str);
-        }
-        Self::try_write(path, value).expect("Failed to write file");
-    }
-
-    fn parse_string_from_file<T: std::str::FromStr, P: AsRef<Path>>(path: &P) -> T {
-        let data: String = Self::read_string_from_file(path);
-
-        match data.trim().parse::<T>() {
-            Ok(parsed) => parsed,
-            Err(_) => panic!("Could not parse {}", data)
-        }
-    }
-
-    fn read_string_from_file<P: AsRef<Path>>(path: &P) -> String {
-        let mut file = File::open(path).expect("Could not open file");
-        let mut data = String::new();
-        file.read_to_string(&mut data).expect("Could not read from file");
-
-        data
-    }
 
     fn get_sensor_path(&self, sensor: TemperatureSensor) -> PathBuf {
         let index = self.get_sensor_index(sensor);

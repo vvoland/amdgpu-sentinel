@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 extern crate signal_hook;
 extern crate num;
 
+mod fan;
+use fan::*;
+mod sysfs;
 mod polaris_gpu;
 use polaris_gpu::*;
 mod clamped_percentage;
@@ -16,6 +19,9 @@ mod stats;
 use stats::*;
 mod circular_buffer;
 use circular_buffer::CircularBuffer;
+mod polaris_gpu_fan;
+mod generic_sysfs_fan;
+mod nct6797_fan;
 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,8 +108,8 @@ impl GpuStateMachine {
             GpuCustomState::Idle => {
                 gpu.set_force_performance_level(PerformanceLevel::Manual);
 
-                gpu.set_fan_mode(FanMode::Manual);
-                gpu.set_fan_speed(ClampedPercentage::new(0));
+                gpu.fan().set_mode(FanMode::Manual);
+                gpu.fan().set_speed(ClampedPercentage::new(0));
                 gpu.set_pcie_level(PcieLevel::Gen1);
 
                 gpu.set_pstate_core(0);
@@ -113,8 +119,8 @@ impl GpuStateMachine {
             GpuCustomState::Performance => {
                 gpu.set_force_performance_level(PerformanceLevel::Manual);
 
-                gpu.set_fan_mode(FanMode::Manual);
-                gpu.set_fan_speed(ClampedPercentage::new(45));
+                gpu.fan().set_mode(FanMode::Manual);
+                gpu.fan().set_speed(ClampedPercentage::new(45));
                 gpu.set_pcie_level(PcieLevel::Gen3);
 
                 gpu.set_pstate_core(7);
@@ -122,8 +128,8 @@ impl GpuStateMachine {
                 gpu.set_power_limit(135f32);
             },
             GpuCustomState::CoolOff => {
-                gpu.set_fan_mode(FanMode::Manual);
-                gpu.set_fan_speed(ClampedPercentage::new(35));
+                gpu.fan().set_mode(FanMode::Manual);
+                gpu.fan().set_speed(ClampedPercentage::new(35));
                 gpu.set_pcie_level(PcieLevel::Gen1);
             }
         }
@@ -159,7 +165,7 @@ fn main() {
         if gathers % gathers_per_update == 0 {
 
             println!("{} temperature: {}C, fan: {}, state: {:?}", rx570.name,
-                rx570.temperature(), rx570.fan_speed(), state_machine.state());
+                rx570.temperature(), rx570.fan().speed(), state_machine.state());
 
             state_machine.step(&rx570);
         }
