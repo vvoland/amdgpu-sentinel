@@ -45,6 +45,13 @@ pub fn parse_string_from_file<T: std::str::FromStr, P: AsRef<Path>>(path: &P) ->
     }
 }
 
+pub fn try_read_string_from_file<P: AsRef<Path>>(path: &P) -> Option<String> {
+    let mut data = String::new();
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut data))
+        .map_or(None, |_| Some(data))
+}
+
 pub fn read_string_from_file<P: AsRef<Path>>(path: &P) -> String {
     let mut file = File::open(path).expect("Could not open file");
     let mut data = String::new();

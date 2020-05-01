@@ -1,12 +1,14 @@
 use crate::clamped_percentage::ClampedPercentage;
 use crate::sysfs;
 use crate::polaris_gpu_fan;
+use crate::polaris_gpu_table;
 
 use std::path::Path;
 use std::fmt::Display;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use polaris_gpu_fan::PolarisGpuFan;
+use polaris_gpu_table::PolarisGpuTable;
 
 pub struct PolarisGpu<'a> {
     pub name: &'a str,
@@ -32,6 +34,12 @@ pub enum PerformanceLevel {
     ProfilePeak
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Part {
+    Core,
+    Memory
+}
+
 impl Display for PerformanceLevel {
 
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> { 
@@ -49,9 +57,8 @@ pub enum PcieLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverclockError {
     Disabled,
-    VoltageNotInRange(RangeInclusive::<u32>),
-    ClockNotInRange(RangeInclusive::<u32>),
-    Unknown(std::io::ErrorKind)
+    Unknown(std::io::ErrorKind),
+    RangesAreImmutable
 }
 
 impl<'a> PolarisGpu<'a> {
@@ -74,6 +81,11 @@ impl<'a> PolarisGpu<'a> {
 
     pub fn temperature(&self) -> f32 {
         self.read_sensor(TemperatureSensor::Edge).expect("GPU has no temperature sensor!")
+    }
+
+    pub fn power_usage(&self) -> f32 {
+        let wattage: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_average"));
+        wattage / Self::WATTAGE_DIVISOR
     }
 
     pub fn power_limit(&self) -> f32 {
@@ -132,21 +144,66 @@ impl<'a> PolarisGpu<'a> {
         sysfs::write(path, &state.to_string());
     }
 
-    pub fn modify_pstate_core(&self, state: u32, clock: u32, voltage: u32) -> Result<(), OverclockError> {
-        let cmd = format!("s {} {} {}", state, clock, voltage);
-        self.modify_pstate(clock, voltage, &cmd, "SCLK")
-    }
-
-    pub fn modify_pstate_memory(&self, state: u32, clock: u32, voltage: u32) -> Result<(), OverclockError> {
-        let cmd = format!("m {} {} {}", state, clock, voltage);
-        self.modify_pstate(clock, voltage, &cmd, "MCLK")
+    pub fn read_pstates(&self) -> Option<PolarisGpuTable> {
+         sysfs::try_read_string_from_file(&self.sysfs_dir.join(Self::PSTATE_TABLE_FILE))
+             .map_or(None, |data| PolarisGpuTable::try_parse(&data))
     }
 
     const PSTATE_TABLE_FILE: &'static str = "pp_od_clk_voltage";
 
-    pub fn commit_pstates(&self) {
-        let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_TABLE_FILE);
-        sysfs::write(path, "c");
+    fn table_to_commands(table: &PolarisGpuTable) -> Vec::<String> {
+        let mut commands = Vec::new();
+        for part in [Part::Core, Part::Memory].iter() {
+            let states = table.states(*part);
+
+            let prefix = match part {
+                Part::Core => "s",
+                Part::Memory => "m"
+            };
+
+            for (idx, state) in states.iter().enumerate() {
+                commands.push(format!("{} {} {} {}", prefix, idx, state.clock, state.voltage));
+            }
+        }
+        commands
+    }
+
+    pub fn set_pstates(&self, new_table: &PolarisGpuTable) -> Result<(), OverclockError> {
+        match self.read_pstates() {
+            Some(current_table) => {
+                if current_table.voltage_range().eq(new_table.voltage_range()) &&
+                    current_table.clock_range(Part::Core).eq(new_table.clock_range(Part::Core)) &&
+                    current_table.clock_range(Part::Memory).eq(new_table.clock_range(Part::Memory))
+                {
+                    let current_table_cmds = Self::table_to_commands(&current_table);
+                    let mut new_table_cmds = Self::table_to_commands(&new_table);
+                    new_table_cmds.retain(|element| !current_table_cmds.contains(element));
+
+                    let path = self.sysfs_dir.join(Self::PSTATE_TABLE_FILE);
+
+                    let mut revert = false;
+                    for cmd in new_table_cmds.iter() {
+                        if sysfs::try_write(&path, &cmd).is_err() {
+                            revert = true;
+                            break;
+                        }
+                    };
+
+                    if !revert {
+                        if new_table_cmds.len() > 0 {
+                            sysfs::write(path, "c");
+                        }
+                        Ok(())
+                    } else {
+                        self.reset_pstates();
+                        Err(OverclockError::Disabled)
+                    }
+                } else {
+                    Err(OverclockError::RangesAreImmutable)
+                }
+            },
+            None => Err(OverclockError::Disabled)
+        }
     }
 
     pub fn reset_pstates(&self) {
@@ -154,90 +211,6 @@ impl<'a> PolarisGpu<'a> {
         sysfs::write(path, "r");
     }
 
-    fn modify_pstate(&self, clock: u32, voltage: u32, cmd: &String, kind: &'static str) 
-            -> Result<(), OverclockError> {
-
-        let path: PathBuf = self.sysfs_dir.join(Self::PSTATE_TABLE_FILE);
-
-        if !path.is_file() {
-            return Err(OverclockError::Disabled);
-        }
-
-        match sysfs::try_write(&path, &cmd) {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                match err.kind() {
-                    std::io::ErrorKind::InvalidData => {
-                        let data: String = sysfs::read_string_from_file(&path);
-                        let clock_range = Self::parse_acceptable_range(&data, kind);
-                        let voltage_range = Self::parse_acceptable_range(&data, "VDDC");
-
-                        if !clock_range.contains(&clock) {
-                            Err(OverclockError::ClockNotInRange(clock_range))
-                        } else if !voltage_range.contains(&voltage) {
-                            Err(OverclockError::VoltageNotInRange(voltage_range))
-                        } else {
-                            panic!("I don't know what I've done wrong! :(");
-                        }
-                    }
-                    other => Err(OverclockError::Unknown(other))
-                }
-            }
-        }
-    }
-
-    /**
-        Example data:  
-        OD_SCLK:
-        0:        300MHz        750mV
-        1:        588MHz        765mV
-        2:        952MHz        931mV
-        3:       1041MHz       1006mV
-        4:       1106MHz       1068mV
-        5:       1168MHz       1131mV
-        6:       1209MHz       1150mV
-        7:       1244MHz       1150mV
-        OD_MCLK:
-        0:        300MHz        750mV
-        1:       1000MHz        800mV
-        2:       1500MHz        900mV
-        OD_RANGE:
-        SCLK:     300MHz       2000MHz
-        MCLK:     300MHz       2250MHz
-        VDDC:     750mV        1150mV
-
-
-        Returns the range specified for given OD_RANGE
-
-        Example usage:
-            parse_acceptable_range(*example data*, "MCLK")
-        should return:
-            RangeInclusive(300, 2250)
-    **/
-    fn parse_acceptable_range(data: &String, entry: &'static str) -> RangeInclusive::<u32> {
-        let line = data
-            .split("\n")
-            .skip_while(|line| line.trim() != "OD_RANGE:")
-            .filter(|line| line.contains(entry))
-            .next().expect("No current memory pstate?!")
-            .trim()
-            .split(":")
-            .skip(1)
-            .next().expect("Range is not prefixed?!")
-            .trim()
-            .replace("mV", "")
-            .replace("MHz", "");
-
-        let mut range_split = line.split_whitespace();
-
-        let lower: &str = range_split.next().expect("Bad range lower bound");
-        let upper: &str = range_split.next().expect("Bad range upper bound");
-
-        let lower_parsed = lower.parse::<u32>().expect("Lower bound is not an integer");
-        let upper_parsed = upper.parse::<u32>().expect("Upper bound is not an integer");
-
-        RangeInclusive::new(lower_parsed, upper_parsed)
-    }
 
     /**
         Example data:  
@@ -350,37 +323,5 @@ impl<'a> PolarisGpu<'a> {
         }
     }
 
-}
-
-mod tests {
-
-    #[test]
-    fn parses_acceptable_range_from_pstate_table() {
-        use super::*;
-
-        let data = "\n\
-        OD_SCLK:\n\
-        0:        300MHz        750mV\n\
-        1:        588MHz        765mV\n\
-        2:        952MHz        931mV\n\
-        3:       1041MHz       1006mV\n\
-        4:       1106MHz       1068mV\n\
-        5:       1168MHz       1131mV\n\
-        6:       1209MHz       1150mV\n\
-        7:       1244MHz       1150mV\n\
-        OD_MCLK:\n\
-        0:        300MHz        750mV\n\
-        1:       1000MHz        800mV\n\
-        2:       1500MHz        900mV\n\
-        OD_RANGE:\n\
-        SCLK:     300MHz       2000MHz\n\
-        MCLK:     300MHz       2250MHz\n\
-        VDDC:     750mV        1150mV\n\
-        ";
-
-        assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "SCLK"), RangeInclusive::new(300, 2000));
-        assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "MCLK"), RangeInclusive::new(300, 2250));
-        assert_eq!(PolarisGpu::parse_acceptable_range(&data.to_owned(), "VDDC"), RangeInclusive::new(750, 1150));
-    }
 }
 
