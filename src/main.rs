@@ -24,7 +24,10 @@ mod generic_sysfs_fan;
 mod nct6797_fan;
 mod polaris_gpu_table;
 use polaris_gpu_table::{PolarisGpuTable, PolarisGpuState};
-
+mod performance_level;
+use performance_level::{PerformanceLevel, ControllablePerformanceLevel};
+mod amdgpu_performance_level;
+mod sysfs_device;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuCustomState {
@@ -122,20 +125,21 @@ impl GpuStateMachine {
                     gpu.set_pstates(&self.idle_table).expect("Failed to change gpu pstate table");
                 }
 
-                gpu.set_force_performance_level(PerformanceLevel::ProfileMinMclk);
+                gpu.set_performance_level(PerformanceLevel::Manual);
 
                 gpu.fan().set_mode(FanMode::Manual);
                 gpu.fan().set_speed(ClampedPercentage::new(0));
                 gpu.set_power_limit(30f32);
+                gpu.set_power_profile_mode(2);
             },
             GpuCustomState::Performance => {
                 gpu.set_pstates(&self.performance_table).expect("Failed to change gpu pstate table");
 
-                gpu.set_force_performance_level(PerformanceLevel::Auto);
+                gpu.set_performance_level(PerformanceLevel::Auto);
 
                 gpu.fan().set_mode(FanMode::Manual);
-                gpu.fan().set_speed(ClampedPercentage::new(45));
-                gpu.set_power_limit(135f32);
+                gpu.fan().set_speed(ClampedPercentage::new(50));
+                gpu.set_power_limit(150f32);
             },
             GpuCustomState::CoolOff => {
                 gpu.fan().set_mode(FanMode::Manual);
@@ -214,12 +218,14 @@ fn main() {
 
     let mut gathers = 0;
 
+    let old_power_limit = rx570.power_limit();
+
     let gpu_table: PolarisGpuTable = rx570.read_pstates().expect("Failed to read gpu pstates");
     let idle_table: PolarisGpuTable = create_idle_table(&gpu_table);
     let performance_table: PolarisGpuTable = create_performance_table(&gpu_table,
-        &PolarisGpuState { clock: 1274, voltage: 1000 },
-        &PolarisGpuState { clock: 1850, voltage: 900 },
-        true);
+        &PolarisGpuState { clock: 1270, voltage: 1025 },
+        &PolarisGpuState { clock: 1700, voltage: 900 },
+        false);
 
     println!("Idle table\r\n{}\r\nPerformance\r\n{}", idle_table, performance_table);
 
@@ -242,7 +248,10 @@ fn main() {
         gathers += 1;
     }
 
-    rx570.set_force_performance_level(PerformanceLevel::Auto);
+    rx570.fan().set_mode(FanMode::Auto);
+    rx570.set_power_profile_mode(1);
+    rx570.set_power_limit(old_power_limit);
+    rx570.set_performance_level(PerformanceLevel::Auto);
     rx570.reset_pstates();
     println!("Qutting...");
 }

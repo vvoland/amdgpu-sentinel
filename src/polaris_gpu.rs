@@ -2,17 +2,22 @@ use crate::clamped_percentage::ClampedPercentage;
 use crate::sysfs;
 use crate::polaris_gpu_fan;
 use crate::polaris_gpu_table;
+use crate::amdgpu_performance_level;
+use crate::sysfs_device;
 
 use std::path::Path;
-use std::fmt::Display;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::fs;
 use polaris_gpu_fan::PolarisGpuFan;
 use polaris_gpu_table::PolarisGpuTable;
+use amdgpu_performance_level::AmdGpuSysfsPerformanceLevel;
+use sysfs_device::SysfsDevice;
 
 pub struct PolarisGpu<'a> {
     pub name: &'a str,
     sysfs_dir: PathBuf,
+    hwmon_dir: PathBuf,
     fan: PolarisGpuFan
 }
 
@@ -22,30 +27,10 @@ pub enum TemperatureSensor {
     Memory
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PerformanceLevel {
-    Auto,
-    Low,
-    High,
-    Manual,
-    ProfileStandard,
-    ProfileMinSclk,
-    ProfileMinMclk,
-    ProfilePeak
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Part {
     Core,
     Memory
-}
-
-impl Display for PerformanceLevel {
-
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> { 
-        std::fmt::Debug::fmt(self, f)
-
-    }
 }
 
 #[derive(Debug)]
@@ -61,12 +46,30 @@ pub enum OverclockError {
     RangesAreImmutable
 }
 
+impl<'a> SysfsDevice for PolarisGpu<'a> {
+    fn sysfs_dir(&self) -> &PathBuf { &self.sysfs_dir }
+}
+
+impl<'a> AmdGpuSysfsPerformanceLevel for PolarisGpu<'a> {
+    fn performance_level_file(&self) -> &'static str { "power_dpm_force_performance_level" }
+}
+
 impl<'a> PolarisGpu<'a> {
     pub fn new<P: AsRef<Path>>(name: &'a str, sysfs_dir: P) -> Self {
+        let dir = sysfs_dir.as_ref();
+        let hwmon_dir = fs::read_dir(dir.join("hwmon"))
+            .expect("Could not access gpu hwmon!")
+            .next()
+            .expect("Could not enumerate hwmon directory")
+            .expect("Gpu has no fans!")
+            .path();
+
+
         PolarisGpu {
             name,
-            sysfs_dir: sysfs_dir.as_ref().to_path_buf(),
-            fan: PolarisGpuFan::new(sysfs_dir.as_ref().join("hwmon/hwmon0"), 1)
+            sysfs_dir: dir.to_path_buf(),
+            hwmon_dir: hwmon_dir.clone(),
+            fan: PolarisGpuFan::new(hwmon_dir, 1)
         }
     }
 
@@ -83,13 +86,17 @@ impl<'a> PolarisGpu<'a> {
         self.read_sensor(TemperatureSensor::Edge).expect("GPU has no temperature sensor!")
     }
 
+    fn hwmon_path(&self, property: &'static str) -> PathBuf {
+        self.hwmon_dir.join(property)
+    }
+
     pub fn power_usage(&self) -> f32 {
-        let wattage: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_average"));
+        let wattage: f32 = sysfs::parse_string_from_file(&self.hwmon_path("power1_average"));
         wattage / Self::WATTAGE_DIVISOR
     }
 
     pub fn power_limit(&self) -> f32 {
-        let wattage: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap"));
+        let wattage: f32 = sysfs::parse_string_from_file(&self.hwmon_path("power1_cap"));
         wattage / Self::WATTAGE_DIVISOR
     }
 
@@ -97,8 +104,8 @@ impl<'a> PolarisGpu<'a> {
     fn to_real_wattage(value: f32) -> u32 { (value * Self::WATTAGE_DIVISOR) as u32 }
 
     pub fn power_limit_range(&self) -> RangeInclusive<f32> {
-        let min: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_min"));
-        let max: f32 = sysfs::parse_string_from_file(&self.sysfs_dir.join("hwmon/hwmon0/power1_cap_max"));
+        let min: f32 = sysfs::parse_string_from_file(&self.hwmon_path("power1_cap_min"));
+        let max: f32 = sysfs::parse_string_from_file(&self.hwmon_path("power1_cap_max"));
 
         let divisor = Self::WATTAGE_DIVISOR;
 
@@ -106,7 +113,7 @@ impl<'a> PolarisGpu<'a> {
     }
 
     pub fn set_power_limit(&self, wattage: f32) -> () {
-        let path: PathBuf = self.sysfs_dir.join("hwmon/hwmon0/power1_cap");
+        let path: PathBuf = self.hwmon_path("power1_cap");
         let range: RangeInclusive<f32> = self.power_limit_range();
 
         if range.contains(&wattage) {
@@ -184,6 +191,7 @@ impl<'a> PolarisGpu<'a> {
                     let mut revert = false;
                     for cmd in new_table_cmds.iter() {
                         if sysfs::try_write(&path, &cmd).is_err() {
+                            println!("Writing {:?} to {} failed", path, cmd);
                             revert = true;
                             break;
                         }
@@ -232,25 +240,11 @@ impl<'a> PolarisGpu<'a> {
         current_state.parse::<u32>().expect("State index is not a number")
     }
 
-    const FORCE_PERFORMANCE_LEVEL_FILE: &'static str = "power_dpm_force_performance_level";
+    const POWER_PROFILE_MODE_FILE: &'static str = "pp_power_profile_mode";
 
-    pub fn force_performance_level(&self) -> PerformanceLevel {
-        let path: PathBuf = self.sysfs_dir.join(Self::FORCE_PERFORMANCE_LEVEL_FILE);
-        let data = sysfs::read_string_from_file(&path).trim().to_string();
-
-        Self::PERFORMANCE_LEVEL_TO_STRING.iter()
-            .filter(|(_, name)| data.eq_ignore_ascii_case(name))
-            .next().expect("Invalid performance level").0.clone()
-    }
-
-    pub fn set_force_performance_level(&self, level: PerformanceLevel) {
-        let path: PathBuf = self.sysfs_dir.join(Self::FORCE_PERFORMANCE_LEVEL_FILE);
-
-        let value: &'static str = Self::PERFORMANCE_LEVEL_TO_STRING.iter()
-            .filter(|(i_level, _)| i_level.eq(&level))
-            .next().expect("Invalid performance level").1;
-
-        sysfs::write(path, value);
+    pub fn set_power_profile_mode(&self, mode: u8) {
+        let path: PathBuf = self.sysfs_dir.join(Self::POWER_PROFILE_MODE_FILE);
+        sysfs::write(path, &mode.to_string());
     }
 
     const PCIE_LEVEL_FILE: &'static str = "pp_dpm_pcie";
@@ -278,10 +272,7 @@ impl<'a> PolarisGpu<'a> {
 
 
     pub fn has_sensor(&self, sensor: TemperatureSensor) -> bool {
-        let index = self.get_sensor_index(sensor);
-
-        let file = format!("hwmon/hwmon0/temp{}_input", index);
-        let path = Path::new(&file);
+        let path = self.get_sensor_path(sensor);
 
         path.is_file()
     }
@@ -297,22 +288,10 @@ impl<'a> PolarisGpu<'a> {
         }
     }
 
-    const PERFORMANCE_LEVEL_TO_STRING: [(PerformanceLevel, &'static str); 8] = [
-            (PerformanceLevel::Auto, "auto"),
-            (PerformanceLevel::Low, "low"),
-            (PerformanceLevel::High, "high"),
-            (PerformanceLevel::Manual, "manual"),
-            (PerformanceLevel::ProfileMinMclk, "profile_min_mclk"),
-            (PerformanceLevel::ProfileMinSclk, "profile_min_sclk"),
-            (PerformanceLevel::ProfilePeak, "profile_peak"),
-            (PerformanceLevel::ProfileStandard, "profile_standard")
-    ];
-
     fn get_sensor_path(&self, sensor: TemperatureSensor) -> PathBuf {
         let index = self.get_sensor_index(sensor);
 
-        let file = format!("hwmon/hwmon0/temp{}_input", index);
-        self.sysfs_dir.join(file)
+        self.hwmon_dir.join(format!("temp{}_input", index))
     }
 
     fn get_sensor_index(&self, sensor: TemperatureSensor) -> u32 {
@@ -324,4 +303,3 @@ impl<'a> PolarisGpu<'a> {
     }
 
 }
-
