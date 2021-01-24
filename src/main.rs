@@ -42,7 +42,60 @@ pub struct GpuStateMachine {
     temperature_buffer: CircularBuffer::<f32>,
     power_usage_buffer: CircularBuffer::<f32>,
     idle_table: PolarisGpuTable,
-    performance_table: PolarisGpuTable
+    performance_table: PolarisGpuTable,
+    performance_curve: Curve
+}
+
+#[derive(Clone)]
+pub struct CurvePoint {
+    temperature: u32,
+    fan_speed: ClampedPercentage
+}
+
+pub struct Curve {
+    points: Vec<CurvePoint>
+}
+
+pub enum CurveInterpolation {
+    Linear
+}
+
+impl Curve {
+    pub fn new(points: Vec::<CurvePoint>) -> Self {
+        if points.len() < 1 {
+            panic!("Invalid curve without any point");
+        }
+        let mut points_vec = points.to_vec();
+        points_vec.sort_by_key(|pt| pt.temperature);
+
+        Curve { points: points_vec }
+    }
+
+    fn interpolate(value: f32, lower: &CurvePoint, upper: &CurvePoint, interpolation: CurveInterpolation) -> ClampedPercentage {
+        let temp_delta: f32 = (upper.temperature - lower.temperature) as f32;
+        let speed_delta: f32 = (upper.fan_speed.0 - lower.fan_speed.0) as f32;
+        let diff: f32 = value - lower.temperature as f32;
+
+        let value: f32 = match interpolation {
+            CurveInterpolation::Linear => {
+                (lower.fan_speed.0 as f32) + (diff / temp_delta) * speed_delta
+            }
+        };
+
+        ClampedPercentage::new(value)
+    }
+
+    pub fn get(&self, temperature: f32, interpolation: CurveInterpolation) -> ClampedPercentage {
+        for (idx, point) in self.points.iter().enumerate().rev() {
+            if temperature as u32 >= point.temperature {
+                // Get next point or the same if last
+                let next_point = self.points.get(idx + 1).unwrap_or(point);
+                return Self::interpolate(temperature, point, next_point, interpolation);
+            }
+        }
+
+        self.points.get(0).expect("Curve must have at least one point").fan_speed
+    }
 }
 
 impl GpuStateMachine {
@@ -51,12 +104,13 @@ impl GpuStateMachine {
         self.state
     }
 
-    pub fn new(buffer_scale: usize, idle_table: PolarisGpuTable, performance_table: PolarisGpuTable) -> Self {
+    pub fn new(buffer_scale: usize, idle_table: PolarisGpuTable, performance_table: PolarisGpuTable, curve: Curve) -> Self {
         GpuStateMachine {
             state: GpuCustomState::Idle,
             usage_buffer: CircularBuffer::new(20 * buffer_scale),
             temperature_buffer: CircularBuffer::new(10 * buffer_scale),
             power_usage_buffer: CircularBuffer::new(5 * buffer_scale),
+            performance_curve: curve,
             idle_table,
             performance_table
         }
@@ -111,7 +165,14 @@ impl GpuStateMachine {
 
         if new_state != self.state {
             self.apply(gpu, new_state);
-            self.state = new_state;
+        }
+        self.apply_dynamic(gpu, new_state, weighted_avg_temperature);
+        self.state = new_state;
+    }
+
+    fn apply_dynamic(&self, gpu: &PolarisGpu<'_>, state: GpuCustomState, temperature: f32) {
+        if state == GpuCustomState::Performance {
+            gpu.fan().set_speed(self.performance_curve.get(temperature, CurveInterpolation::Linear));
         }
     }
 
@@ -138,7 +199,6 @@ impl GpuStateMachine {
                 gpu.set_performance_level(PerformanceLevel::Auto);
 
                 gpu.fan().set_mode(FanMode::Manual);
-                gpu.fan().set_speed(ClampedPercentage::new(50));
                 gpu.set_power_limit(150f32);
             },
             GpuCustomState::CoolOff => {
@@ -220,6 +280,14 @@ fn main() {
 
     let old_power_limit = rx570.power_limit();
 
+    let curve = Curve::new(vec![
+        CurvePoint { temperature: 50, fan_speed: ClampedPercentage::new(0f64) },
+        CurvePoint { temperature: 55, fan_speed: ClampedPercentage::new(30f64) },
+        CurvePoint { temperature: 65, fan_speed: ClampedPercentage::new(35f64) },
+        CurvePoint { temperature: 75, fan_speed: ClampedPercentage::new(45f64) },
+        //CurvePoint { temperature: 80, fan_speed: ClampedPercentage::new(70f64) }
+    ]);
+
     let gpu_table: PolarisGpuTable = rx570.read_pstates().expect("Failed to read gpu pstates");
     let idle_table: PolarisGpuTable = create_idle_table(&gpu_table);
     let performance_table: PolarisGpuTable = create_performance_table(&gpu_table,
@@ -229,7 +297,7 @@ fn main() {
 
     println!("Idle table\r\n{}\r\nPerformance\r\n{}", idle_table, performance_table);
 
-    let mut state_machine = GpuStateMachine::new(gathers_per_update, idle_table, performance_table);
+    let mut state_machine = GpuStateMachine::new(gathers_per_update, idle_table, mining_table, curve);
     state_machine.apply(&rx570, GpuCustomState::Idle);
 
     while !term.load(Ordering::Relaxed) {
