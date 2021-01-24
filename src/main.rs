@@ -248,6 +248,9 @@ fn create_performance_table<'a>(table: &'a PolarisGpuTable,
             if new_state.voltage > highest_state.voltage {
                 new_state.voltage = highest_state.voltage;
             }
+            if new_state.clock > highest_state.clock {
+                new_state.clock = highest_state.clock;
+            }
 
             perf_table.set_state(*part, idx, new_state).unwrap();
         }
