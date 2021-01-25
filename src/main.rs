@@ -1,9 +1,10 @@
-use std::convert::TryInto;
+use std::{fs::File, convert::TryInto};
 use std::ops::Div;
 use std::path::Path;
 use std::{thread, time};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::prelude::*;
 
 extern crate signal_hook;
 extern crate num;
@@ -33,7 +34,8 @@ mod sysfs_device;
 pub enum GpuCustomState {
     Idle,
     CoolOff,
-    Performance
+    Performance,
+    Mining
 }
 
 pub struct GpuStateMachine {
@@ -43,6 +45,7 @@ pub struct GpuStateMachine {
     power_usage_buffer: CircularBuffer::<f32>,
     idle_table: PolarisGpuTable,
     performance_table: PolarisGpuTable,
+    mining_table: PolarisGpuTable,
     performance_curve: Curve
 }
 
@@ -98,13 +101,45 @@ impl Curve {
     }
 }
 
+static MINER_NAMES: &[&str] = &[
+    "lolMiner",
+    "teamredminer",
+    "xmrig"
+];
+
+fn is_mining() -> bool {
+    for it in std::fs::read_dir("/proc/").expect("No /proc?!") {
+        if let Ok(process_dir) = it {
+            if let Some(dir_name) = process_dir.file_name().to_str() {
+                if dir_name.chars().all(char::is_numeric)  {
+                    let name_path = process_dir.path().join("comm");
+                    if let Ok(mut name_file) = File::open(name_path) {
+                        let mut name = String::new();
+                        if let Ok(_) = name_file.read_to_string(&mut name) {
+                            if MINER_NAMES.contains(&name.as_str().trim()) {
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 impl GpuStateMachine {
 
     pub fn state(&self) -> GpuCustomState {
         self.state
     }
 
-    pub fn new(buffer_scale: usize, idle_table: PolarisGpuTable, performance_table: PolarisGpuTable, curve: Curve) -> Self {
+    pub fn new(buffer_scale: usize,
+        idle_table: PolarisGpuTable,
+        performance_table: PolarisGpuTable,
+        mining_table: PolarisGpuTable,
+        curve: Curve) -> Self {
         GpuStateMachine {
             state: GpuCustomState::Idle,
             usage_buffer: CircularBuffer::new(20 * buffer_scale),
@@ -112,7 +147,8 @@ impl GpuStateMachine {
             power_usage_buffer: CircularBuffer::new(5 * buffer_scale),
             performance_curve: curve,
             idle_table,
-            performance_table
+            performance_table,
+            mining_table
         }
     }
 
@@ -134,7 +170,11 @@ impl GpuStateMachine {
             current_temperature, weighted_avg_usage, weighted_avg_temperature);
 
         let new_state = if weighted_avg_usage > 95f64 || (weighted_avg_usage > 0.5f64 && weighted_avg_power_usage > 40f32) {
-            GpuCustomState::Performance
+            if is_mining() {
+                GpuCustomState::Mining
+            } else {
+                GpuCustomState::Performance
+            }
         } else {
             match self.state {
                 GpuCustomState::Idle => {
@@ -153,7 +193,7 @@ impl GpuStateMachine {
                         self.state
                     }
                 },
-                GpuCustomState::Performance => {
+                GpuCustomState::Performance | GpuCustomState::Mining => {
                     if weighted_avg_power_usage > power_treshold || weighted_avg_usage >= 10f64 {
                         self.state
                     } else {
@@ -171,8 +211,13 @@ impl GpuStateMachine {
     }
 
     fn apply_dynamic(&self, gpu: &PolarisGpu<'_>, state: GpuCustomState, temperature: f32) {
-        if state == GpuCustomState::Performance {
-            gpu.fan().set_speed(self.performance_curve.get(temperature, CurveInterpolation::Linear));
+        let fan = gpu.fan();
+        match state {
+            GpuCustomState::Performance =>
+                fan.set_speed(self.performance_curve.get(temperature, CurveInterpolation::Linear)),
+            GpuCustomState::Mining =>
+                fan.set_speed(ClampedPercentage::new(40f64)),
+            _ => {}
         }
     }
 
@@ -200,6 +245,15 @@ impl GpuStateMachine {
 
                 gpu.fan().set_mode(FanMode::Manual);
                 gpu.set_power_limit(150f32);
+            },
+            GpuCustomState::Mining => {
+                gpu.set_pstates(&self.mining_table).expect("Failed to change gpu pstate table");
+
+                gpu.set_performance_level(PerformanceLevel::Manual);
+                gpu.set_power_profile_mode(5);
+
+                gpu.fan().set_mode(FanMode::Manual);
+                gpu.set_power_limit(110f32);
             },
             GpuCustomState::CoolOff => {
                 gpu.fan().set_mode(FanMode::Manual);
@@ -288,19 +342,23 @@ fn main() {
         CurvePoint { temperature: 55, fan_speed: ClampedPercentage::new(30f64) },
         CurvePoint { temperature: 65, fan_speed: ClampedPercentage::new(35f64) },
         CurvePoint { temperature: 75, fan_speed: ClampedPercentage::new(45f64) },
-        //CurvePoint { temperature: 80, fan_speed: ClampedPercentage::new(70f64) }
+        CurvePoint { temperature: 80, fan_speed: ClampedPercentage::new(70f64) }
     ]);
 
     let gpu_table: PolarisGpuTable = rx570.read_pstates().expect("Failed to read gpu pstates");
     let idle_table: PolarisGpuTable = create_idle_table(&gpu_table);
     let performance_table: PolarisGpuTable = create_performance_table(&gpu_table,
-        &PolarisGpuState { clock: 1270, voltage: 1025 },
+        &PolarisGpuState { clock: 1250, voltage: 1025 },
         &PolarisGpuState { clock: 1700, voltage: 900 },
         false);
+    let mining_table: PolarisGpuTable = create_performance_table(&gpu_table,
+        &PolarisGpuState { clock: 1000, voltage: 800 },
+        &PolarisGpuState { clock: 1800, voltage: 800 },
+        false);
 
-    println!("Idle table\r\n{}\r\nPerformance\r\n{}", idle_table, performance_table);
+    println!("Idle table\r\n{}\r\nPerformance\r\n{}\r\nMining {}", idle_table, performance_table, mining_table);
 
-    let mut state_machine = GpuStateMachine::new(gathers_per_update, idle_table, mining_table, curve);
+    let mut state_machine = GpuStateMachine::new(gathers_per_update, idle_table, performance_table, mining_table, curve);
     state_machine.apply(&rx570, GpuCustomState::Idle);
 
     while !term.load(Ordering::Relaxed) {
