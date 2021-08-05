@@ -107,26 +107,34 @@ static MINER_NAMES: &[&str] = &[
     "xmrig"
 ];
 
-fn is_mining() -> bool {
-    for it in std::fs::read_dir("/proc/").expect("No /proc?!") {
-        if let Ok(process_dir) = it {
-            if let Some(dir_name) = process_dir.file_name().to_str() {
-                if dir_name.chars().all(char::is_numeric)  {
-                    let name_path = process_dir.path().join("comm");
-                    if let Ok(mut name_file) = File::open(name_path) {
-                        let mut name = String::new();
-                        if let Ok(_) = name_file.read_to_string(&mut name) {
-                            if MINER_NAMES.contains(&name.as_str().trim()) {
-                                return true
-                            }
-                        }
-                    }
-                }
+#[cfg(target_os = "linux")]
+fn procfs_get_name(dir: std::fs::DirEntry) -> Option<String> {
+    dir.file_name().to_str()
+        // If directory name is a pid
+        .filter(|dirname| dirname.chars().all(char::is_numeric))
+        .map(|_| dir.path().join("comm"))
+        // Open /proc/<PID>/comm file
+        .and_then(|path| File::open(path).ok())
+        .as_mut()
+        // Read the name from comm file
+        .and_then(|file| {
+            let mut name = String::new();
+            match file.read_to_string(&mut name) {
+                Ok(_) => Some(name),
+                Err(_) => None
             }
-        }
-    }
+        })
+}
 
-    false
+
+#[cfg(target_os = "linux")]
+fn is_mining() -> bool {
+    std::fs::read_dir("/proc/")
+        .expect("No /proc?!")
+        .flat_map(|dir_or_err| dir_or_err)
+        .flat_map(procfs_get_name)
+        // Is any process a miner?
+        .any(|name| MINER_NAMES.contains(&name.as_str().trim()))
 }
 
 impl GpuStateMachine {
